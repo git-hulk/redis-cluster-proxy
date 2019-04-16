@@ -130,11 +130,11 @@ redisCluster *createCluster(int numthreads) {
     return cluster;
 }
 
-static void freeClusterNode(clusterNode *node) {
+void freeClusterNode(clusterNode *node) {
     if (node == NULL) return;
-    int i;
+    int i, numconnections = (node->cluster ? node->cluster->numthreads : 1);
     if (node->connections) {
-        for (i = 0; i < node->cluster->numthreads; i++) {
+        for (i = 0; i < numconnections; i++) {
             redisClusterConnection *conn = node->connections[i];
             if (conn == NULL) continue;
             freeClusterConnection(conn);
@@ -174,9 +174,13 @@ void freeCluster(redisCluster *cluster) {
     zfree(cluster);
 }
 
-static clusterNode *createClusterNode(char *ip, int port, redisCluster *c) {
+clusterNode *createClusterNode(char *ip, int port, redisCluster *c) {
     clusterNode *node = zcalloc(sizeof(*node));
     if (!node) return NULL;
+    /* If cluster *c is NULL, the node is privately owned by a client, so
+     * it will only have one connection, otherwise, it will have one
+     * connection per thread. */
+    int numconnections = (c ? c->numthreads : 1);
     node->cluster = c;
     node->ip = sdsnew(ip);
     node->port = port;
@@ -191,13 +195,13 @@ static clusterNode *createClusterNode(char *ip, int port, redisCluster *c) {
     node->migrating_count = 0;
     node->importing_count = 0;
     node->connections =
-        zcalloc(c->numthreads * sizeof(redisClusterConnection *));
+        zcalloc(numconnections * sizeof(redisClusterConnection *));
     if (node->connections == NULL) {
         freeClusterNode(node);
         return NULL;
     }
     int i = 0;
-    for(; i < c->numthreads; i++) {
+    for(; i < numconnections; i++) {
         node->connections[i] = createClusterConnection();
         if (node->connections[i] == NULL) {
             freeClusterNode(node);
@@ -207,15 +211,31 @@ static clusterNode *createClusterNode(char *ip, int port, redisCluster *c) {
     return node;
 }
 
+clusterNode *duplicateClusterNode(clusterNode *source, redisCluster *c) {
+    clusterNode *node = createClusterNode(source->ip, source->port, c);
+    if (!node) return NULL;
+    if (source->name) node->name = sdsdup(source->name);
+    node->clone_of = source;
+    return node;
+}
+
 redisContext *getClusterNodeContext(clusterNode *node, int thread_id) {
-    if (thread_id < 0) thread_id = node->cluster->numthreads - thread_id;
-    if (thread_id >= node->cluster->numthreads) return NULL;
+    int numconnections;
+    if (node->cluster != NULL) {
+        numconnections = node->cluster->numthreads;
+        if (thread_id >= numconnections) return NULL;
+        if (thread_id < 0) thread_id = numconnections - thread_id;
+    } else {
+        numconnections = 1;
+        thread_id = 0;
+    }
     redisClusterConnection *conn = node->connections[thread_id];
     assert(conn != NULL);
     return conn->context;
 }
 
 redisContext *clusterNodeConnect(clusterNode *node, int thread_id) {
+    if (node->cluster == NULL) thread_id = 0;
     redisContext *ctx = getClusterNodeContext(node, thread_id);
     if (ctx) redisFree(ctx);
     proxyLogDebug("Connecting to node %s:%d\n", node->ip, node->port);
@@ -430,10 +450,10 @@ cleanup:
     return success;
 }
 
-clusterNode *searchNodeBySlot(redisCluster *cluster, int slot) {
+clusterNode *searchNodeBySlot(rax *map, int slot) {
     clusterNode *node = NULL;
     raxIterator iter;
-    raxStart(&iter, cluster->slots_map);
+    raxStart(&iter, map);
     int slot_be = htonl(slot);
     if (!raxSeek(&iter, ">=", (unsigned char*) &slot_be, sizeof(slot_be))) {
         proxyLogErr("Failed to seek cluster node into slots map.\n");
@@ -445,20 +465,18 @@ clusterNode *searchNodeBySlot(redisCluster *cluster, int slot) {
     return node;
 }
 
-clusterNode *getNodeByKey(redisCluster *cluster, char *key, int keylen,
-                          int *getslot)
-{
+clusterNode *getNodeByKey(rax *map, char *key, int keylen, int *getslot) {
     clusterNode *node = NULL;
     int slot = clusterKeyHashSlot(key, keylen);
-    node = searchNodeBySlot(cluster, slot);
+    node = searchNodeBySlot(map, slot);
     if (node && getslot != NULL) *getslot = slot;
     return node;
 }
 
-clusterNode *getFirstMappedNode(redisCluster *cluster) {
+clusterNode *getFirstMappedNode(rax *map) {
     clusterNode *node = NULL;
     raxIterator iter;
-    raxStart(&iter, cluster->slots_map);
+    raxStart(&iter, map);
     if (!raxSeek(&iter, "^", NULL, 0)) {
         raxStop(&iter);
         return NULL;
@@ -466,4 +484,10 @@ clusterNode *getFirstMappedNode(redisCluster *cluster) {
     if (raxNext(&iter)) node = (clusterNode *) iter.data;
     raxStop(&iter);
     return node;
+}
+
+redisClusterConnection *getClusterConnection(clusterNode *node, int thread_id) {
+    if (node->cluster == NULL) thread_id = 0;
+    else if (thread_id >= node->cluster->numthreads) return NULL;
+    return node->connections[thread_id];
 }

@@ -55,7 +55,6 @@
 
 #define UNUSED(V) ((void) V)
 
-#define getClusterConnection(node, thread_id) (node->connections[thread_id])
 #define enqueueRequestToSend(req) (enqueueRequest(req, QUEUE_TYPE_SENDING))
 #define dequeueRequestToSend(req) (dequeueRequest(req, QUEUE_TYPE_SENDING))
 #define enqueuePendingRequest(req) (enqueueRequest(req, QUEUE_TYPE_PENDING))
@@ -109,6 +108,7 @@ static int prepareRequestForReadingReply(clientRequest *req);
 static clientRequest *getFirstQueuedRequest(list *queue, int *is_empty);
 static int enqueueRequest(clientRequest *req, int queue_type);
 static void dequeueRequest(clientRequest *req, int queue_type);
+static int disableMultiplexingForClient(client *c);
 
 /* Hiredis helpers */
 
@@ -221,25 +221,27 @@ static int parseAddress(char *address, char **ip, int *port, char **hostsocket)
 
 static void printHelp(void) {
     fprintf(stderr, "Usage: redis-cluster-proxy [OPTIONS] "
-            "cluster_host:cluster_port\n"
-            "  -p, --port <port>    Port (default: %d)\n"
-            "  --max-clients <n>    Max clients (default: %d)\n"
-            "  --threads <n>        Thread number (default: %d, max: %d)\n"
-            "  --tcpkeepalive       TCP Keep Alive (default: %d)\n"
-            "  --daemonize          Execute the proxy in background\n"
-            "  -a, --auth <passw>   Authentication password\n"
-            "  --disable-colors     Disable colorized output\n"
-            "  --log-level <level>  Minimum log level: (default: info)\n"
-            "                       (debug|info|success|warning|error)\n"
-            "  --dump-queries       Dump query args (only for log-level "
-                                    "'debug') \n"
-            "  --dump-buffer        Dump query buffer (only for log-level "
-                                    "'debug') \n"
-            "  --dump-queues        Dump request queues (only for log-level "
-                                    "'debug') \n"
-            "  -h, --help         Print this help\n",
-            DEFAULT_PORT, DEFAULT_MAX_CLIENTS, DEFAULT_THREADS,
-            DEFAULT_TCP_KEEPALIVE, MAX_THREADS);
+        "cluster_host:cluster_port\n"
+        "  -p, --port <port>            Port (default: %d)\n"
+        "  --max-clients <n>            Max clients (default: %d)\n"
+        "  --threads <n>                Thread number (default: %d, max: %d)\n"
+        "  --tcpkeepalive               TCP Keep Alive (default: %d)\n"
+        "  --daemonize                  Execute the proxy in background\n"
+        "  --disable-multiplexing <opt> When should multiplexing disabled\n"
+        "                               (never|auto|always) (default: auto)\n"
+        "  -a, --auth <passw>           Authentication password\n"
+        "  --disable-colors             Disable colorized output\n"
+        "  --log-level <level>          Minimum log level: (default: info)\n"
+        "                               (debug|info|success|warning|error)\n"
+        "  --dump-queries               Dump query args (only for log-level "
+                                        "'debug') \n"
+        "  --dump-buffer                Dump query buffer (only for log-level "
+                                        "'debug') \n"
+        "  --dump-queues                Dump request queues (only for log-level"
+                                        "'debug') \n"
+        "  -h, --help                   Print this help\n",
+        DEFAULT_PORT, DEFAULT_MAX_CLIENTS, DEFAULT_THREADS,
+        DEFAULT_TCP_KEEPALIVE, MAX_THREADS);
 }
 
 static int parseOptions(int argc, char **argv) {
@@ -272,6 +274,19 @@ static int parseOptions(int argc, char **argv) {
                                 MAX_THREADS);
                 config.num_threads = MAX_THREADS;
             } else if (config.num_threads < 1) config.num_threads = 1;
+        } else if (!strcmp("--disable-multiplexing", arg) && !lastarg) {
+            char *val = argv[++i];
+            if (!strcasecmp("never", val))
+                config.disable_multiplexing = CFG_DISABLE_MULTIPLEXING_NEVER;
+            else if (!strcasecmp("always", val))
+                config.disable_multiplexing = CFG_DISABLE_MULTIPLEXING_ALWAYS;
+            else if (!strcasecmp("auto", val))
+                config.disable_multiplexing = CFG_DISABLE_MULTIPLEXING_AUTO;
+            else {
+                fprintf(stderr, "Invalid option for --disable-multiplexing, "
+                        "valid options are:\nnever|auto|always\n");
+                exit(1);
+            }
         } else if (!strcmp("--log-level", arg) && !lastarg) {
             char *level_name = argv[++i];
             int j = 0, level = -1;
@@ -318,6 +333,7 @@ static void initConfig(void) {
     config.dump_queries = 0;
     config.dump_buffer = 0;
     config.dump_queues = 0;
+    config.disable_multiplexing = CFG_DISABLE_MULTIPLEXING_AUTO;
     config.auth = NULL;
 }
 
@@ -606,7 +622,76 @@ static client *createClient(int fd, char *ip) {
     c->next_request_id = 0;
     c->min_reply_id = 0;
     c->requests_with_write_handler = 0;
+    c->slots_map = NULL;
+    if (config.disable_multiplexing == CFG_DISABLE_MULTIPLEXING_ALWAYS) {
+        if (!disableMultiplexingForClient(c)) {
+            freeClient(c);
+            return NULL;
+        }
+    }
     return c;
+}
+
+/* Disable multiplexing on the specified client by creating a private
+ * slots map (radix tree) on the client itself. The slots map will be
+ * a duplicate of the shared map (proxy.cluster->slots_map), and every
+ * node in the map will be a duplicate of the shared map's corresponding
+ * node, but the duplicated node will have the cluster member set to
+ * NULL, so that it will have just one connection (redisClusterConnection *).
+ * This connection will give client a private socket to the node and private
+ * request queues. */
+static int disableMultiplexingForClient(client *c) {
+    proxyLogDebug("Disabling multiplexing for client %llu\n", c->id);
+    if (c->slots_map != NULL) return 1;
+    c->slots_map = raxNew();
+    if (c->slots_map == NULL) return 0;
+    rax *shared_map = proxy.cluster->slots_map;
+    raxIterator iter;
+    raxStart(&iter, shared_map);
+    if (!raxSeek(&iter, "^", NULL, 0)) goto failed;
+    while (raxNext(&iter)) {
+        clusterNode *source = (clusterNode *) iter.data;
+        clusterNode *node = duplicateClusterNode(source, NULL);
+        if (node == NULL) goto failed;
+        raxInsert(c->slots_map, iter.key, iter.key_len, node, NULL);
+        redisClusterConnection *conn =
+            getClusterConnection(source, c->thread_id);
+
+        /* Move requests from shared connection to private connection. */
+        listIter li;
+        listNode *ln;
+        listRewind(conn->requests_to_send, &li);
+        while ((ln = listNext(&li))) {
+            clientRequest *req = ln->value;
+            if (req->client != c) continue;
+            if (req->has_write_handler) continue;
+            /* Replace request node with duplicated node owned by the client */
+            req->node = node;
+            listAddNodeTail(node->connections[0]->requests_to_send, req);
+            listDelNode(conn->requests_to_send, ln);
+            req->owned_by_client = 1;
+        }
+        listRewind(conn->requests_pending, &li);
+        while ((ln = listNext(&li))) {
+            clientRequest *req = ln->value;
+            if (req->client != c) continue;
+            if (req->has_read_handler) continue;
+            req->node = node;
+            listAddNodeTail(node->connections[0]->requests_pending, req);
+            listDelNode(conn->requests_pending, ln);
+            req->owned_by_client = 1;
+        }
+    }
+    raxStop(&iter);
+
+    return 1;
+failed:
+    raxStop(&iter);
+    if (c->slots_map) {
+        raxFree(c->slots_map);
+        c->slots_map = NULL;
+    }
+    return 0;
 }
 
 static void unlinkClient(client *c) {
@@ -687,6 +772,18 @@ static void freeClient(client *c) {
     freeAllClientRequests(c);
     if (c->unordered_requests)
         raxFreeWithCallback(c->unordered_requests, (void (*)(void*))sdsfree);
+    if (c->slots_map) {
+        raxIterator iter;
+        raxStart(&iter, c->slots_map);
+        if (raxSeek(&iter, "^", NULL, 0)) {
+            while (raxNext(&iter)) {
+                clusterNode *node = (clusterNode *) iter.data;
+                freeClusterNode(node);
+            }
+        }
+        raxStop(&iter);
+        raxFree(c->slots_map);
+    }
     zfree(c);
     proxy.numclients--;
 }
@@ -1026,9 +1123,11 @@ static sds getRequestCommand(clientRequest *req) {
 static clusterNode *getRequestNode(clientRequest *req, sds *err) {
     clusterNode *node = NULL;
     int slot = UNDEFINED_SLOT;
+    rax *map = (req->owned_by_client ? req->client->slots_map :
+                                       proxy.cluster->slots_map);
     if (req->argc == 1) {
         /*TODO: temporary behaviour */
-        node = getFirstMappedNode(proxy.cluster);
+        node = getFirstMappedNode(map);
         req->node = node;
         return node;
     }
@@ -1042,8 +1141,7 @@ static clusterNode *getRequestNode(clientRequest *req, sds *err) {
     if (key_step < 1) key_step = 1;
     for (i = first_key; i <= last_key; i += key_step) {
         char *key = req->buffer + req->offsets[i];
-        clusterNode *n = getNodeByKey(proxy.cluster, key, req->lengths[i],
-                                      &slot);
+        clusterNode *n = getNodeByKey(map, key, req->lengths[i], &slot);
         if (n == NULL) break;
         if (node == NULL) node = n;
         else {
@@ -1142,7 +1240,7 @@ static clientRequest *getFirstQueuedRequest(list *queue, int *is_empty) {
 static redisClusterConnection *getRequestConnection(clientRequest *req) {
     clusterNode *node = req->node;
     if (node == NULL) return NULL;
-    return node->connections[req->client->thread_id];
+    return getClusterConnection(node, req->client->thread_id);
 }
 
 static int enqueueRequest(clientRequest *req, int queue_type) {
@@ -1199,6 +1297,7 @@ static clientRequest *createRequest(client *c) {
     /* TODO: this could lead to issues in reply sequencing */
     if (c->next_request_id >= UINT64_MAX)
         c->next_request_id = 0;
+    req->owned_by_client = (c->slots_map != NULL);
 
     proxyLogDebug("Created Request %llu:%llu\n", req->client->id, req->id);
     return req;
@@ -1699,7 +1798,7 @@ int main(int argc, char **argv) {
         int j;
         clusterNode *last_n = NULL;
         for (j = 0; j < CLUSTER_SLOTS; j++) {
-            clusterNode *n = searchNodeBySlot(proxy.cluster, j);
+            clusterNode *n = searchNodeBySlot(proxy.cluster->slots_map, j);
             if (n == NULL) {
                 proxyLogErr("NULL node for slot %d\n", j);
                 break;

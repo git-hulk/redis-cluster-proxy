@@ -27,6 +27,7 @@
 #define CLUSTER_SLOTS 16384
 
 struct redisCluster;
+struct clusterNode;
 
 typedef struct redisClusterConnection {
     redisContext *context;
@@ -52,6 +53,7 @@ typedef struct clusterNode {
                      * strings are the source node IDs. */
     int migrating_count; /* Length of the migrating array (migrating slots*2) */
     int importing_count; /* Length of the importing array (importing slots*2) */
+    struct clusterNode *clone_of;
     pthread_mutex_t connection_mutex;
 } clusterNode;
 
@@ -68,8 +70,11 @@ int fetchClusterConfiguration(redisCluster *cluster, char *ip, int port,
 redisContext *getClusterNodeContext(clusterNode *node, int thread_id);
 redisContext *clusterNodeConnect(clusterNode *node, int thread_id);
 redisContext *clusterNodeConnectAtomic(clusterNode *node, int thread_id);
-clusterNode *searchNodeBySlot(redisCluster *cluster, int slot);
-clusterNode *getNodeByKey(redisCluster *cluster, char *key, int keylen,
-                          int *getslot);
-clusterNode *getFirstMappedNode(redisCluster *cluster);
+clusterNode *searchNodeBySlot(rax *map, int slot);
+clusterNode *getNodeByKey(rax *map, char *key, int keylen, int *getslot);
+clusterNode *getFirstMappedNode(rax *map);
+clusterNode *createClusterNode(char *ip, int port, redisCluster *c);
+clusterNode *duplicateClusterNode(clusterNode *source, redisCluster *c);
+redisClusterConnection *getClusterConnection(clusterNode *node, int thread_id);
+void freeClusterNode(clusterNode *node);
 #endif /* __REDIS_CLUSTER_PROXY_CLUSTER_H__ */

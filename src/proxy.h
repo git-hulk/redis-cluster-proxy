@@ -33,7 +33,8 @@
 #define CLIENT_STATUS_LINKED        1
 #define CLIENT_STATUS_UNLINKED      2
 
-#define getClientLoop(c) (proxy.threads[c->thread_id]->loop)
+#define getClientLoop(c)        (proxy.threads[c->thread_id]->loop)
+#define getClientThread(c)      (proxy.threads[c->thread_id])
 
 struct client;
 struct proxyThread;
@@ -58,6 +59,7 @@ typedef struct clientRequest{
     int parsing_status;
     int has_write_handler;
     int has_read_handler;
+    int owned_by_client;
     struct clientRequest *prev_request; /* Previous pipelined request */
     struct clientRequest *next_request; /* Next pipelined request */
 } clientRequest;
@@ -91,6 +93,7 @@ typedef struct client {
     list *requests_to_process;       /* Requests not completely parsed */
     int requests_with_write_handler; /* Number of request that are still
                                       * being writing to cluster */
+    rax *slots_map;
 } client;
 
 void freeRequest(clientRequest *req, int delete_from_lists);
